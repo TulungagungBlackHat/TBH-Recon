@@ -49,7 +49,7 @@ def main():
     parser.add_argument("--html",help="Save HTML report")
     args=parser.parse_args()
     url=args.url if args.url.startswith("http") else "https://"+args.url
-    domain=urlparse(url).netloc
+    domain=urlparse(url).hostname or urlparse(url).netloc
     ip=socket.gethostbyname(domain)
     print(f"\033[96m[*] {domain} ({ip})\033[0m")
     report={"target":domain,"ip":ip,"url":url,"time":str(datetime.now())}
