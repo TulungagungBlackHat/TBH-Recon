@@ -1,80 +1,202 @@
 #!/usr/bin/env python3
-# TBH-Recon v2.0 Pro - JSON + HTML Report
-import socket, requests, argparse, sys, ssl, json
-from datetime import datetime
+"""TBH-Recon v3 - Web reconnaissance with JSON/HTML reports (authorized testing only)."""
+import argparse, json, os, socket, ssl, sys
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-BANNER = """\033[91m╔════════════════════════════════════════╗
-\033[91m║  \033[97m TBH-RECON v2.0 Pro \033[91m- JSON/HTML Report \033[91m║
-\033[91m║  \033[90m Tulungagung Black Hat | uchil404 \033[91m║
-\033[91m╚════════════════════════════════════════╝\033[0m"""
+try:
+    import requests
+except ImportError:
+    print("[!] requests required: pip install requests", file=sys.stderr)
+    sys.exit(2)
 
-PORT_CVE = {21:"FTP anon",22:"SSH",80:"HTTP",443:"HTTPS",445:"SMB MS17-010",3306:"MySQL",3389:"RDP BlueKeep",6379:"Redis",8080:"HTTP-Alt"}
+VERSION = "3.0"
+REPO = "https://github.com/TulungagungBlackHat/TBH-Recon"
 
-def check_headers(url):
-    r = requests.get(url, timeout=5, headers={'User-Agent':'TBH-Recon/2.0'})
-    headers = dict(r.headers)
-    missing = [h for h in ['Strict-Transport-Security','Content-Security-Policy','X-Frame-Options'] if h not in headers]
-    return {"status":r.status_code,"server":headers.get('Server','Unknown'),"missing":missing,"headers":headers}
+def banner():
+    if os.environ.get("NO_COLOR"):
+        return ""
+    return ("\033[91m╔════════════════════════════════════╗\n"
+            "║ \033[97mTBH-Recon v3\033[91m - Full First Pass     \033[91m║\n"
+            "║ \033[90mTulungagung Black Hat | uchil404 \033[91m║\n"
+            "╚════════════════════════════════════╝\033[0m")
 
-def check_ssl(domain):
+def color(code, text, enabled=True):
+    return f"\033[{code}m{text}\033[0m" if enabled else text
+
+PORTS = [21, 22, 25, 53, 80, 110, 143, 443, 445, 3306, 3389, 5432, 6379, 8080, 8443]
+SUBS = ["www", "mail", "api", "admin", "dev", "test", "staging", "app"]
+IMPORTANT_HEADERS = ["Strict-Transport-Security", "Content-Security-Policy", "X-Frame-Options",
+                     "X-Content-Type-Options", "Referrer-Policy", "Permissions-Policy"]
+
+def build_session(args):
+    s = requests.Session()
+    s.headers["User-Agent"] = f"TBH-Recon/{VERSION} (+{REPO})"
+    if args.cookie:
+        s.headers["Cookie"] = args.cookie
+    for h in args.header or []:
+        name, _, val = h.partition(":")
+        if val:
+            s.headers[name.strip()] = val.strip()
+    if args.proxy:
+        s.proxies = {"http": args.proxy, "https": args.proxy}
+    return s
+
+def check_headers(session, url, args):
+    r = session.get(url, timeout=args.timeout)
+    missing = [h for h in IMPORTANT_HEADERS if h not in r.headers]
+    return {"status": r.status_code, "server": r.headers.get("Server", ""),
+            "powered_by": r.headers.get("X-Powered-By", ""),
+            "missing": missing, "headers": dict(r.headers)}
+
+def check_ssl(domain, args):
     try:
-        ctx=ssl.create_default_context()
+        ctx = ssl.create_default_context()
         with ctx.wrap_socket(socket.socket(), server_hostname=domain) as s:
-            s.settimeout(3); s.connect((domain,443)); cert=s.getpeercert()
-            expire=cert.get('notAfter'); issuer=dict(x[0] for x in cert.get('issuer',[])).get('organizationName','Unknown')
-            exp_dt=datetime.strptime(expire, "%b %d %H:%M:%S %Y %Z")
-            days=(exp_dt - datetime.utcnow()).days
-            return {"issuer":issuer,"expire":expire,"days":days}
+            s.settimeout(args.timeout)
+            s.connect((domain, 443))
+            cert = s.getpeercert()
+        expire = cert.get("notAfter")
+        issuer = dict(x[0] for x in cert.get("issuer", ())).get("organizationName", "Unknown")
+        days = (datetime.strptime(expire, "%b %d %H:%M:%S %Y %Z")
+                .replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).days
+        return {"issuer": issuer, "expire": expire, "days": days}
     except Exception as e:
-        return {"error":str(e)}
+        return {"error": str(e)}
 
-def port_scan(target, ports):
-    open_ports=[]
-    for port in ports:
-        s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.settimeout(1)
-        if s.connect_ex((target,port))==0:
-            open_ports.append({"port":port,"info":PORT_CVE.get(port,"Unknown")})
-        s.close()
+def port_scan(ip, ports, timeout):
+    open_ports = []
+
+    def probe(port):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout if timeout <= 2 else 1.0)
+        try:
+            if s.connect_ex((ip, port)) == 0:
+                return port
+        except OSError:
+            pass
+        finally:
+            s.close()
+        return None
+
+    with ThreadPoolExecutor(max_workers=30) as ex:
+        for p in ex.map(probe, ports):
+            if p:
+                open_ports.append({"port": p})
     return open_ports
 
-def main():
-    print(BANNER)
-    parser=argparse.ArgumentParser(description="TBH-Recon v2.0 Pro")
-    parser.add_argument("-u","--url",required=True,help="Target URL")
-    parser.add_argument("--ssl",action="store_true",help="SSL check")
-    parser.add_argument("-p","--ports",action="store_true",help="Port scan")
-    parser.add_argument("-s","--subdomain",action="store_true")
-    parser.add_argument("--json",help="Save JSON report")
-    parser.add_argument("--html",help="Save HTML report")
-    args=parser.parse_args()
-    url=args.url if args.url.startswith("http") else "https://"+args.url
-    domain=urlparse(url).hostname or urlparse(url).netloc
-    ip=socket.gethostbyname(domain)
-    print(f"\033[96m[*] {domain} ({ip})\033[0m")
-    report={"target":domain,"ip":ip,"url":url,"time":str(datetime.now())}
-    report["headers"]=check_headers(url)
-    print(f"\033[92m[+] Status {report['headers']['status']} | Missing: {report['headers']['missing'] or 'none'}\033[0m")
-    if args.ssl:
-        report["ssl"]=check_ssl(domain)
-        print(f"\033[92m[+] SSL: {report['ssl']}\033[0m")
-    if args.ports:
-        report["ports"]=port_scan(ip, list(PORT_CVE.keys()))
-        print(f"\033[92m[+] Ports: {report['ports']}\033[0m")
-    if args.subdomain:
-        common=['www','mail','api']; found=[]
-        for sub in common:
-            try: socket.gethostbyname(f"{sub}.{domain}"); found.append(f"{sub}.{domain}")
-            except: pass
-        report["subdomains"]=found
-        print(f"\033[92m[+] Subdomains: {found}\033[0m")
-    if args.json:
-        open(args.json,'w').write(json.dumps(report,indent=2))
-        print(f"\033[92m[✓] JSON saved: {args.json}\033[0m")
-    if args.html:
-        html=f"<html><body><h1>TBH-Recon Pro Report {domain}</h1><pre>{json.dumps(report,indent=2)}</pre></body></html>"
-        open(args.html,'w').write(html)
-        print(f"\033[92m[✓] HTML saved: {args.html}\033[0m")
-    print("\033[92m[✓] Pro Done\033[0m")
+def subdomain_enum(domain):
+    found = []
+    for sub in SUBS:
+        try:
+            found.append({"host": f"{sub}.{domain}", "ip": socket.gethostbyname(f"{sub}.{domain}")})
+        except socket.gaierror:
+            pass
+    return found
 
-if __name__=="__main__": main()
+def build_findings(report):
+    findings = []
+    for h in report.get("headers", {}).get("missing", []):
+        findings.append({"severity": "Low", "title": f"Missing {h}", "fix": f"Set {h} header"})
+    if report.get("headers", {}).get("powered_by"):
+        findings.append({"severity": "Info", "title": "Technology disclosed (X-Powered-By)",
+                         "detail": report["headers"]["powered_by"], "fix": "Suppress header"})
+    ssl_info = report.get("ssl", {})
+    if isinstance(ssl_info.get("days"), int) and ssl_info["days"] < 30:
+        findings.append({"severity": "Medium", "title": f"SSL expires in {ssl_info['days']} days",
+                         "fix": "Renew certificate"})
+    risky = {6379: "Redis", 27017: "MongoDB", 2375: "Docker API"}
+    for p in report.get("ports", []):
+        if p["port"] in risky:
+            findings.append({"severity": "High", "title": f"{risky[p['port']]} port {p['port']} open",
+                             "fix": "Restrict exposure / require auth"})
+    return findings
+
+def write_html(report, path):
+    html = f"""<html><head><title>TBH-Recon {report['target']}</title></head>
+<body style="font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px">
+<h1 style="color:#ff0000">TBH-Recon v{VERSION} - {report['target']} ({report['ip']})</h1>
+<p>Time: {report['time']}</p>
+<h2>Findings</h2><pre>{json.dumps(report.get('findings', []), indent=2)}</pre>
+<h2>Raw report</h2><pre>{json.dumps({k: v for k, v in report.items() if k != 'findings'}, indent=2)}</pre>
+<p>Generated by TBH-Recon v{VERSION} - Tulungagung Black Hat</p></body></html>"""
+    with open(path, "w") as fh:
+        fh.write(html)
+
+def main():
+    parser = argparse.ArgumentParser(description=f"TBH-Recon v{VERSION}")
+    parser.add_argument("-u", "--url", required=True)
+    parser.add_argument("--ssl", action="store_true", help="SSL certificate check")
+    parser.add_argument("-p", "--ports", action="store_true", help="port scan")
+    parser.add_argument("-s", "--subdomain", action="store_true", help="subdomain enumeration")
+    parser.add_argument("--proxy", help="e.g. http://127.0.0.1:8080")
+    parser.add_argument("--cookie", help="Cookie header value")
+    parser.add_argument("-H", "--header", action="append", help="extra header, repeatable")
+    parser.add_argument("--timeout", type=float, default=8.0)
+    parser.add_argument("--json", help="save JSON report")
+    parser.add_argument("--html", help="save HTML report")
+    parser.add_argument("--no-color", action="store_true")
+    parser.add_argument("--version", action="version", version=f"TBH-Recon {VERSION}")
+    args = parser.parse_args()
+    print(banner())
+
+    use_color = not args.no_color and not os.environ.get("NO_COLOR")
+    print(color("91", "[!] Authorized targets only.", use_color))
+    url = args.url if "://" in args.url else "https://" + args.url
+    domain = urlparse(url).hostname or urlparse(url).netloc
+    try:
+        ip = socket.gethostbyname(domain)
+    except socket.gaierror:
+        print(color("91", f"[!] cannot resolve {domain}", use_color), file=sys.stderr)
+        sys.exit(2)
+
+    print(color("96", f"[*] {domain} ({ip})", use_color))
+    session = build_session(args)
+    report = {"tool": "TBH-Recon", "version": VERSION, "target": domain, "ip": ip, "url": url,
+              "time": str(datetime.now(timezone.utc))}
+
+    try:
+        report["headers"] = check_headers(session, url, args)
+        print(color("92", f"[+] Status {report['headers']['status']} | "
+                          f"Missing: {', '.join(report['headers']['missing']) or 'none'}", use_color))
+    except requests.RequestException as e:
+        report["headers"] = {"error": str(e)}
+        print(color("90", f"[-] Headers: {e}", use_color))
+
+    if args.ssl:
+        report["ssl"] = check_ssl(domain, args)
+        print(color("92", f"[+] SSL: {report['ssl']}", use_color))
+    if args.ports:
+        report["ports"] = port_scan(ip, PORTS, args.timeout)
+        print(color("92", f"[+] Ports: {[p['port'] for p in report['ports']]}", use_color))
+    if args.subdomain:
+        report["subdomains"] = subdomain_enum(domain)
+        print(color("92", f"[+] Subdomains: {[s['host'] for s in report['subdomains']]}", use_color))
+
+    report["findings"] = build_findings(report)
+    for f in report["findings"]:
+        sev = {"High": "91", "Medium": "93", "Low": "90", "Info": "90"}[f["severity"]]
+        print(color(sev, f"[{f['severity']}] {f['title']} -> {f['fix']}", use_color))
+
+    if args.json:
+        try:
+            with open(args.json, "w") as fh:
+                json.dump(report, fh, indent=2)
+            print(f"[✓] JSON: {args.json}")
+        except OSError as e:
+            print(color("91", f"[!] cannot write JSON: {e}", use_color), file=sys.stderr)
+            sys.exit(2)
+    if args.html:
+        try:
+            write_html(report, args.html)
+            print(f"[✓] HTML: {args.html}")
+        except OSError as e:
+            print(color("91", f"[!] cannot write HTML: {e}", use_color), file=sys.stderr)
+            sys.exit(2)
+
+    print(color("92", "[✓] Done", use_color))
+    sys.exit(1 if any(f["severity"] in ("High", "Medium") for f in report["findings"]) else 0)
+
+if __name__ == "__main__":
+    main()
