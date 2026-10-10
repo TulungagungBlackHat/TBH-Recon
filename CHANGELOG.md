@@ -16,3 +16,9 @@
 - JSON report schema with tool/version/target/ip/findings
 ### Fixed
 - Bare except on DNS, utcnow deprecation, unhandled request failures
+
+## [3.1.0] - 2026-10-11
+### Added
+- Multi-target scanning: --targets file (one URL per line)
+- Aggregated JSON {targets, summary} for scope-wide recon
+- -u no longer required when --targets is given; unresolvable targets skipped

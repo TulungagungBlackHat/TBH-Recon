@@ -11,7 +11,7 @@ except ImportError:
     print("[!] requests required: pip install requests", file=sys.stderr)
     sys.exit(2)
 
-VERSION = "3.0"
+VERSION = "3.1"
 REPO = "https://github.com/TulungagungBlackHat/TBH-Recon"
 
 def banner():
@@ -124,32 +124,26 @@ def write_html(report, path):
     with open(path, "w") as fh:
         fh.write(html)
 
-def main():
-    parser = argparse.ArgumentParser(description=f"TBH-Recon v{VERSION}")
-    parser.add_argument("-u", "--url", required=True)
-    parser.add_argument("--ssl", action="store_true", help="SSL certificate check")
-    parser.add_argument("-p", "--ports", action="store_true", help="port scan")
-    parser.add_argument("-s", "--subdomain", action="store_true", help="subdomain enumeration")
-    parser.add_argument("--proxy", help="e.g. http://127.0.0.1:8080")
-    parser.add_argument("--cookie", help="Cookie header value")
-    parser.add_argument("-H", "--header", action="append", help="extra header, repeatable")
-    parser.add_argument("--timeout", type=float, default=8.0)
-    parser.add_argument("--json", help="save JSON report")
-    parser.add_argument("--html", help="save HTML report")
-    parser.add_argument("--no-color", action="store_true")
-    parser.add_argument("--version", action="version", version=f"TBH-Recon {VERSION}")
-    args = parser.parse_args()
-    print(banner())
+def read_targets(path):
+    targets = []
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    targets.append(line)
+    except OSError as e:
+        print(f"[!] cannot read targets file: {e}", file=sys.stderr)
+    return targets
 
-    use_color = not args.no_color and not os.environ.get("NO_COLOR")
-    print(color("91", "[!] Authorized targets only.", use_color))
-    url = args.url if "://" in args.url else "https://" + args.url
+def recon_one(raw_url, args, use_color):
+    url = raw_url if "://" in raw_url else "https://" + raw_url
     domain = urlparse(url).hostname or urlparse(url).netloc
     try:
         ip = socket.gethostbyname(domain)
     except socket.gaierror:
-        print(color("91", f"[!] cannot resolve {domain}", use_color), file=sys.stderr)
-        sys.exit(2)
+        print(color("91", f"[!] cannot resolve {domain}, skipped", use_color), file=sys.stderr)
+        return None
 
     print(color("96", f"[*] {domain} ({ip})", use_color))
     session = build_session(args)
@@ -178,25 +172,70 @@ def main():
     for f in report["findings"]:
         sev = {"High": "91", "Medium": "93", "Low": "90", "Info": "90"}[f["severity"]]
         print(color(sev, f"[{f['severity']}] {f['title']} -> {f['fix']}", use_color))
+    return report
+
+def main():
+    parser = argparse.ArgumentParser(description=f"TBH-Recon v{VERSION}")
+    parser.add_argument("-u", "--url", help="target URL")
+    parser.add_argument("--targets", help="file with one URL per line (multi-target)")
+    parser.add_argument("--ssl", action="store_true", help="SSL certificate check")
+    parser.add_argument("-p", "--ports", action="store_true", help="port scan")
+    parser.add_argument("-s", "--subdomain", action="store_true", help="subdomain enumeration")
+    parser.add_argument("--proxy", help="e.g. http://127.0.0.1:8080")
+    parser.add_argument("--cookie", help="Cookie header value")
+    parser.add_argument("-H", "--header", action="append", help="extra header, repeatable")
+    parser.add_argument("--timeout", type=float, default=8.0)
+    parser.add_argument("--json", help="save JSON report")
+    parser.add_argument("--html", help="save HTML report (single target only)")
+    parser.add_argument("--no-color", action="store_true")
+    parser.add_argument("--version", action="version", version=f"TBH-Recon {VERSION}")
+    args = parser.parse_args()
+    if not args.url and not args.targets:
+        parser.error("-u or --targets is required")
+    print(banner())
+
+    use_color = not args.no_color and not os.environ.get("NO_COLOR")
+    print(color("91", "[!] Authorized targets only.", use_color))
+    targets = ([args.url] if args.url else []) + (read_targets(args.targets) if args.targets else [])
+
+    reports = []
+    for i, t in enumerate(targets):
+        if i > 0 and args.targets:
+            print(color("96", "-" * 40, use_color))
+        r = recon_one(t, args, use_color)
+        if r:
+            reports.append(r)
+
+    if not reports:
+        sys.exit(2)
 
     if args.json:
+        data = (reports[0] if len(reports) == 1 else
+                {"tool": "TBH-Recon", "version": VERSION,
+                 "summary": {"targets": len(reports),
+                             "findings": sum(len(r["findings"]) for r in reports)},
+                 "targets": reports})
         try:
             with open(args.json, "w") as fh:
-                json.dump(report, fh, indent=2)
+                json.dump(data, fh, indent=2)
             print(f"[✓] JSON: {args.json}")
         except OSError as e:
             print(color("91", f"[!] cannot write JSON: {e}", use_color), file=sys.stderr)
             sys.exit(2)
     if args.html:
-        try:
-            write_html(report, args.html)
-            print(f"[✓] HTML: {args.html}")
-        except OSError as e:
-            print(color("91", f"[!] cannot write HTML: {e}", use_color), file=sys.stderr)
-            sys.exit(2)
+        if len(reports) > 1:
+            print(color("93", "[!] --html is single-target; skipped for multi-target scan", use_color))
+        else:
+            try:
+                write_html(reports[0], args.html)
+                print(f"[✓] HTML: {args.html}")
+            except OSError as e:
+                print(color("91", f"[!] cannot write HTML: {e}", use_color), file=sys.stderr)
+                sys.exit(2)
 
     print(color("92", "[✓] Done", use_color))
-    sys.exit(1 if any(f["severity"] in ("High", "Medium") for f in report["findings"]) else 0)
+    sys.exit(1 if any(f["severity"] in ("High", "Medium")
+                      for r in reports for f in r["findings"]) else 0)
 
 if __name__ == "__main__":
     main()
